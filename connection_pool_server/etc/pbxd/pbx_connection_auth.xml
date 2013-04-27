@@ -1,0 +1,9 @@
+<pbx-systems>
+
+<!-- this file should be  protected for obvious reasons -->
+
+<pbx name='n1'   hostname='ip or host' port='22' login='username' password='a strong passwd' connection_type='ssh' atdt='' />
+<pbx name='n2'   hostname='ip or host' port='22' login='username' password='a strong passwd' connection_type='ssh' atdt='' />
+<pbx name='n3'   hostname='ip or host' port='22' login='username' password='a strong passwd' connection_type='ssh' atdt='' />
+
+</pbx-systems>

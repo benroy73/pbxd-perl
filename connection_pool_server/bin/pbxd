@@ -1,0 +1,266 @@
+#!/usr/bin/perl -w
+
+=head1 NAME
+
+pbxd - a server that provides a pool of connections to a PBX
+
+=head1 SYNOPSIS
+
+auto launch from an init.d script
+
+=head1 DESCRIPTION
+
+This server maintains a pools of connections to a PBX console and makes it available via XML to a web proxy service.
+
+=head1 AUTHOR
+
+Benjamin Roy <benroy@uw.edu>
+    Copyright: 2011
+    License: Apache 2.0
+
+=head1 VERSION
+
+$Id: $
+
+=head1 LOCATION
+
+$URL: $
+
+=cut
+
+package pbxd;
+
+use strict;
+use Data::Dumper;
+use base qw(Net::Server::PreFork); # any personality will do
+use XML::Simple;
+use Getopt::Long;
+use PBX::DEFINITY;
+use Log::Log4perl;
+
+my $node;  # the PBX::DEFINITY instance
+my $last_command_had_fatal_error = 0;  # seting this to 1 will terminate this instance of pbxd
+
+GetOptions(
+    "node=s"  => \my $pbxd_nodename,
+    "debug"   => \my $DEBUG
+);
+unless (defined $pbxd_nodename) {
+    die "\nUsage: $0 --node <n1|n2|uw01|ondemand> [--debug]\n\n";
+}
+
+Log::Log4perl::init_and_watch('/etc/log4/pbxd.conf', 600);
+my $LOGGER =  Log::Log4perl->get_logger('pbxd');
+
+my $config_file = "/etc/pbxd/pbxd-". $pbxd_nodename .".conf";
+
+pbxd->run({ conf_file => $config_file });
+
+
+### over-ridden subs below
+
+sub child_init_hook() {
+    $LOGGER->debug("-- child init hook --");
+    unless ( $pbxd_nodename eq 'ondemand' ) {
+        $node = new PBX::DEFINITY($pbxd_nodename, 1);
+        unless( $node && $node->status_connection() ) {
+            $LOGGER->error("FATAL: Login failed for ". $node->get_node_name());
+            die("ERROR: Login failed for ". $node->get_node_name() );
+        }
+        $LOGGER->debug($node->get_debug_message_log());
+        $node->set_debug_state(1);  # reset the PBX::DEFINITY log array
+    }
+}
+
+sub child_finish_hook() {
+    $LOGGER->debug("-- child finish hook --");
+    disconnect_pbx_session();
+}
+
+sub process_request {
+    my $self = shift;
+    my $result;
+    my $timeout_message;
+
+    $LOGGER->debug("-- process_request --");
+
+    eval {
+        my $xml = "";
+
+        local $SIG{'ALRM'} = sub {
+            $result->{error}->{text} = $timeout_message;
+            print XMLout($result, ContentKey => 'text', RootName => 'command');
+            $LOGGER->debug($node->get_debug_message_log());
+            $node->set_debug_state(1);  # reset the PBX::DEFINITY log array
+            $LOGGER->error($timeout_message);
+            die;
+        };
+
+        alarm 30; # a request must be entered within 30 seconds
+        $timeout_message = "Timeout waiting for client input.";
+
+        while (<STDIN>) {
+            s/\r?\n$//;
+            my $line = $_;
+            last if ( $line =~ m/END OF REQUEST/ );
+            $xml .= "$line\n";
+        }
+
+        alarm 300; # now give the PBX 5 minutes to complete the command and return the results
+        $timeout_message = "Timeout waiting for PBX results.";
+
+        print XMLout( process_pbx_command($xml), ContentKey => 'text', RootName => 'command' );
+
+        alarm 0; # clear the timeout
+    };
+
+    if ($last_command_had_fatal_error) { # if anything fails the child must try to disconnect and then exit
+        my $msg = $node->get_last_error_message();
+        $LOGGER->error("FATAL ERROR: ". $msg);
+        disconnect_pbx_session();
+        die("FATAL ERROR: ". $msg);
+    }
+
+    # now that we're back to waiting for another command, we'll logout if we don't get another request soon
+    if ($pbxd_nodename eq 'ondemand') {
+        local $SIG{'ALRM'} = sub {
+            disconnect_pbx_session();
+        };
+        alarm 60;
+    }
+    $LOGGER->debug("-- process_request finished --");
+
+    return;
+}
+
+sub disconnect_pbx_session() {
+    $node->do_logoff() if defined $node;
+    $LOGGER->debug($node->get_debug_message_log());
+    $node->set_debug_state(1);  # reset the PBX::DEFINITY log array
+    $node = undef;
+}
+
+sub process_pbx_command {
+    my ($xml) = @_;
+    my $request = XMLin( $xml, ForceArray => [ 'field' ] );
+    my $result;
+
+    $LOGGER->debug("-- process_pbx_command xml:\n$xml");
+
+    $result->{cmd} = $request->{cmd};
+    $result->{cmdType} = $request->{cmdType};
+
+    my $verbose = $DEBUG;
+    if ( defined $request->{verbose} ) {
+        if ($request->{verbose} =~ m/(true|t|1)/i ) {
+            $verbose = 1;
+        }
+    }
+
+    if ( not defined $request->{pbxName} ) {
+        # the client must specify the PBX name in the XML request
+        $result->{error}->{text} = "You must specify a pbxName.";
+        $LOGGER->error("You must specify a pbxName.");
+        return $result;
+    }
+    elsif ( $pbxd_nodename ne 'ondemand' && $pbxd_nodename ne $request->{pbxName}) {
+        # if this is not an ondemand server the client request must match the PBX this server is connected to.
+        $result->{error}->{text} = "This server is connected to $pbxd_nodename but you requested ". $request->{pbxName};
+        $LOGGER->error("This server is connected to $pbxd_nodename but you requested ". $request->{pbxName});
+        return $result;
+    }
+    elsif ( $pbxd_nodename eq 'ondemand' ) {
+        # if this is the ondemand server then we need to make sure we setup the connection to the correct PBX
+        if ( defined $node ) {
+            # already connected to a PBX so don't need reconnect if it's the same one this client is requesting
+            if ( $node->get_node_name() ne $request->{pbxName}) {
+                # not the requested PBX so disconnect then reconnect to the correct PBX
+                disconnect_pbx_session();
+                $node = new PBX::DEFINITY($request->{pbxName}, 1);
+                $LOGGER->debug($node->get_debug_message_log());
+                $node->set_debug_state(1);  # reset the PBX::DEFINITY log array
+            }
+        }
+        else {
+            # there's no connection to a PBX already, so get connected
+            $node = new PBX::DEFINITY($request->{pbxName}, 1);
+            $LOGGER->debug($node->get_debug_message_log());
+            $node->set_debug_state(1);  # reset the PBX::DEFINITY log array
+        }
+
+        # now verify our connection state
+        unless( $node && $node->status_connection() ) {
+            $LOGGER->error("FATAL: Login failed for ". $node->get_node_name());
+            die("ERROR: Login failed for ". $node->get_node_name() );
+        }
+    }
+    $result->{pbxName} = $request->{pbxName};
+
+    if ( $request->{cmdType} eq 'ossi' ) {
+        my %fields = ();
+        foreach my $request_field ( @{$request->{field}} ){
+            my $fid = $request_field->{fid};
+            my $val = "";
+            if ( defined $request_field->{content} ) {
+                $val = $request_field->{content}
+            }
+            else {
+                $val = '';
+            }
+            $fields{$fid} = $val;
+        }
+
+        # send the command and fields to the PBX
+        $node->pbx_command( $request->{cmd}, %fields );
+        if ( $node->last_command_succeeded() ) {
+            my @ossi_objects = $node->get_ossi_objects();
+            for (my $i=0; $i < scalar @ossi_objects; $i++) {
+                my $ossi_object = $ossi_objects[$i];
+                $result->{"ossi_object"}[$i]->{i} = $i+1;
+                my $f = 0;
+                for my $field ( sort keys %$ossi_object ) {
+                    my $value = $ossi_object->{$field};
+                    $result->{"ossi_object"}[$i]->{field}[$f]->{fid} = $field;
+                    unless( defined $value ) { $value = '' };
+                    $result->{"ossi_object"}[$i]->{field}[$f]->{text} = $value;
+                    $f++;
+                }
+            }
+        }
+        else { # error message from PBX
+            $result->{error}->{text} = $node->get_last_error_message();
+            if ($node->get_last_error_message() =~ m/ERROR: .* in pbx_command/ ) {
+                $last_command_had_fatal_error = 1;
+            }
+        }
+    }
+    elsif ( $request->{cmdType} eq 'vt220' ) {
+        if ( $node->pbx_vt220_command( $request->{cmd} ) ) {
+            my @screens = $node->get_vt220_screens();
+            for (my $s=0; $s < scalar @screens; $s++) {
+                $result->{screen}[$s]->{page} = $s+1;
+                $result->{screen}[$s]->{text} = $screens[$s];
+            }
+        }
+        else { # error message from PBX
+            $result->{error}->{text} = $node->get_last_error_message();
+            if ($node->get_last_error_message() =~ m/ERROR: .* in pbx_command/ ) {
+                $last_command_had_fatal_error = 1;
+            }
+        }
+    }
+    else {
+        $result->{error}->{text} = "unknown cmdType";
+    }
+
+    if ($verbose) {
+        $result->{verbose}->{text} = $node->get_debug_message_log();
+    }
+    $LOGGER->debug($node->get_debug_message_log());
+    $node->set_debug_state(1);  # reset the PBX::DEFINITY log array
+
+    $LOGGER->debug(sub { Dumper($result) });
+    return $result;
+}
+
+1;

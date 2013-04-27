@@ -1,0 +1,7 @@
+order deny,allow
+satisfy any
+
+Deny from all
+Allow from localhost
+
+#Allow from other.trusted.client.host

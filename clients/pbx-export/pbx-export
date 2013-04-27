@@ -1,0 +1,249 @@
+#!/usr/bin/python
+import sys, os, csv, getopt
+import urllib, urllib2
+from lxml import etree
+from optparse import OptionParser
+from datetime import datetime
+
+"""
+=head1 NAME
+
+pbx-export
+
+=head1 SYNOPSIS
+
+Usage:
+    pbx-export node "action object %1" output_file.csv [--input_command="pbx command" --input_var_field="FieldId"][--input_file="file.csv"]
+
+    Example 1:
+    pbx-export n1 "display station %1" out.csv --input_command="list station count 5" --input_var_field=8005ff00
+
+    Example 2:
+    pbx-export n1 "display station %1" out.csv --input_file="file.csv"
+
+    Example 3:
+    pbx-export n1 "list station count 5" out.csv
+
+    You can use Example 3 to identify the Field Id that you want to use as the input variable.
+
+
+Options:
+  -h, --help                      show this help message and exit
+
+  --input_file=FILE               FILE to get list of variables from
+
+  --input_command="Command"       PBX command to get list of variables from
+
+  --input_var_field=FieldId       FieldId from the PBX command to use as variable
+
+  --output_field_ids="FieldIds"   comma separated list of FieldIds to include in output
+
+  -a, --append                    Append to csv file instead of creating a new file
+
+  -t, --timestamp                 put a timestamp on each row
+
+  -q, --quite                     suppress status messages
+
+=head1 DESCRIPTION
+
+Run list, display or status commands in a PBX and get the output in a CSV spreadsheet
+
+=head1 AUTHOR
+
+Benjamin Roy ( benroy@uw.edu )
+
+=head1 VERSION
+
+$Id: $
+
+=head1 LOCATION
+
+$URL: $
+
+=cut
+"""
+
+
+def runPbxCommand( node, command, output_format, ossi_field_list_xml = '' ):
+    pbxd_service_url = 'https://?your pbxd web proxy host?/pbxd/v2/index.cgi'
+    request_xml = "<command pbxName='" + node + "' cmdType='"+ output_format +"' cmd='" + command +"'>" + ossi_field_list_xml +"</command>"
+    post_data = { 'request':request_xml }
+    req = urllib2.Request( pbxd_service_url, urllib.urlencode(post_data) )
+    response = urllib2.urlopen(req)
+    response = response.read().strip()
+    root = etree.XML( response )
+    #for screen in root.xpath('/command/screen'):
+    #    print screen.get('page_number')
+    #    print screen.text
+    #for ossi_object in root.xpath('/command/ossi_object'):
+    #    print ossi_object.get('i')
+    #    for field in ossi_object.xpath('field'):
+    #        print field.text
+    #        print field.get('fid')
+    return root
+
+
+def main():
+
+    usage = """
+    %prog node \"action object %1\" output_file.csv [--input_command="pbx command" --input_var_field="FieldId"][--input_file="file.csv"]
+
+    Example 1:
+    %prog n1 "display station %1" out.csv --input_command="list station count 5" --input_var_field=8005ff00
+
+    Example 2:
+    %prog n1 "display station %1" out.csv --input_file="file.csv"
+
+    Example 3:
+    %prog n1 "list station count 5" out.csv
+
+    You can use Example 3 to identify the Field Id that you want to use as the input variable.
+    """
+    parser = OptionParser(usage=usage)
+    parser.add_option("--input_file", dest="input_file", help="FILE to get list of variables from", metavar="FILE")
+    parser.add_option("--input_command", dest="input_command", help="PBX command to get list of variables from", metavar="\"Command\"")
+    parser.add_option("--input_var_field", dest="input_var_field", help="FieldId from the PBX command to use as variable", metavar="FieldId")
+    parser.add_option("--output_field_ids", dest="output_field_ids", help="comma separated list of FieldIds to include in output", metavar="\"FieldIds\"")
+    parser.add_option("-a", "--append", dest="append_to_output_file", action="store_true", default=False, help="Append to csv file instead of creating a new file")
+    parser.add_option("-t", "--timestamp", dest="timestamp_rows", action="store_true", default=False, help="put a timestamp on each row")
+    parser.add_option("-q", "--quiet", dest="quiet", action="store_true", default=False, help="suppress status messages")
+
+    (options, args) = parser.parse_args()
+
+    if len(args) != 3:
+        print "wrong number of arguments"
+        print "Try --help' for more information"
+        sys.exit(1)
+
+    if (args[1].find('%') > -1 and options.input_command == None and options.input_file == None):
+        parser.error("options --input_command or --input_file is required for the input variable")
+
+    if (args[1].find('%') == -1 and (options.input_command != None or options.input_file != None)):
+        parser.error("options --input_command or --input_file are required to use a variable in the command")
+
+    if options.input_command and options.input_file:
+        parser.error("options --input_command and --input_file are mutually exclusive")
+
+    if options.input_command and options.input_var_field == None:
+        parser.error("options --input_command also requires --input_var_field")
+
+    node              = args[0]
+    command_template  = args[1]
+    csv_ouput_file    = args[2]
+
+    input_var_file    = options.input_file
+    input_var_command = options.input_command
+    input_var_field   = options.input_var_field
+    append_to_output_file = options.append_to_output_file
+    timestamp_rows = options.timestamp_rows
+
+    if options.output_field_ids != None:
+        output_field_id_list = options.output_field_ids.split(',')
+    else:
+        output_field_id_list = []
+    output_field_ids = ''
+    for f in output_field_id_list:
+        output_field_ids = output_field_ids + "<field fid='" + f + "'/>"
+
+
+    pbx_action = command_template.split()[0]
+    if pbx_action not in ('list', 'display', 'status'):
+        parser.error("Invalid action.  This tool has only been tested with 'list', 'display', and 'status' pbx commands.")
+
+
+
+    input_var_values = []
+
+    if input_var_file != None:  # get the input variable list from a csv file
+        if not options.quiet:
+            print "Importing PBX variable data from file", input_var_file
+        try:
+            csvReader = csv.reader(open(input_var_file, 'rb'))
+        except IOError, ie:
+            print ie
+            sys.exit(1)
+        for row in csvReader:
+            input_var_values.append(row[0])
+    elif input_var_command != None:  # get the input variable list from the input_var_command
+        if not options.quiet:
+            print "Gathering PBX variable data..."
+        command1_results = runPbxCommand(node, input_var_command, 'ossi', "<field fid='" + input_var_field + "'/>")
+        for ossi_object in command1_results.xpath('/command/ossi_object'):
+            for field in ossi_object.xpath("field[@fid='" + input_var_field + "']"):
+                input_var_values.append(field.text)
+
+
+    spreadsheet = {}
+    field_ids = {} # a dict that will be the header row in the csv. key and value are the same.
+    fieldnames = [] # the ordered list of fields for the csv output columns
+
+    if not options.quiet:
+        print "Running PBX commands to build csv file..."
+
+    if len(input_var_values) < 1:
+        command_timestamp = str(datetime.now())
+        pbx_command = command_template
+        pbx_results = runPbxCommand(node, pbx_command, 'ossi', output_field_ids)
+        for ossi_object in pbx_results.xpath('/command/ossi_object'):
+            i = ossi_object.get('i')
+            spreadsheet[i] = {}
+            for field in ossi_object.xpath("field"):
+                spreadsheet[i][field.get('fid')] = field.text if field.text != None else ''
+                field_ids[field.get('fid')] = field.get('fid')
+            if timestamp_rows:
+                spreadsheet[i]['timestamp'] = command_timestamp
+                field_ids['timestamp'] = 'timestamp'
+        fieldnames.extend(sorted(field_ids.keys()))
+    else:
+        if pbx_action == 'list':
+            first_column = 'original_command'
+        else:
+            first_column = command_template.split()[1]
+        fieldnames.extend([first_column])
+        for v in input_var_values:
+            command_timestamp = str(datetime.now())
+            pbx_command = command_template.replace('%1', v, 1)
+            if not options.quiet:
+                print pbx_command
+            pbx_results = runPbxCommand(node, pbx_command, 'ossi', output_field_ids)
+            o = 0
+            for ossi_object in pbx_results.xpath('/command/ossi_object'):
+                o = o + 1
+                if pbx_action == 'list':
+                    i = node + ": " + pbx_command + " [" + str(o) + "]"
+                else:
+                    i = node + "-" + v
+                spreadsheet[i] = {}
+                spreadsheet[i][first_column] = i
+                for field in ossi_object.xpath("field"):
+                    spreadsheet[i][field.get('fid')] = field.text if field.text != None else ''
+                    field_ids[field.get('fid')] = field.get('fid')
+                if timestamp_rows:
+                    spreadsheet[i]['timestamp'] = command_timestamp
+                    field_ids['timestamp'] = 'timestamp'
+        fieldnames.extend(sorted(field_ids.keys()))
+        field_ids[first_column] = first_column
+
+    if not os.path.isfile(csv_ouput_file):
+        append_to_output_file = False
+
+    if csv_ouput_file == '-':
+        output_file = sys.stdout
+    elif append_to_output_file:
+        output_file = open(csv_ouput_file, 'ab')
+    else:
+        output_file = open(csv_ouput_file, 'wb')
+
+    csvWriter = csv.DictWriter(output_file, fieldnames, restval='')
+    if not append_to_output_file:
+        csvWriter.writerow(field_ids) # the header row
+
+    for row in sorted(spreadsheet.keys()):
+        csvWriter.writerow(spreadsheet[row])
+
+    if csv_ouput_file != '-' and not options.quiet:
+        print csv_ouput_file + " file saved"
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,2 @@
+$STARTUP_COMMAND="/usr/local/bin/pbxd --node n1";
+$TEST_COMMAND = "curl --max-time 60 --retry 1 --retry-delay 5 -s -d \"request=<command pbxName='n1' cmdType='ossi' cmd='display time' />\" https://?your pbxd server?/pbxd/v2/ | grep -q 'ossi_object i='";

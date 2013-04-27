@@ -1,0 +1,14 @@
+div.table {
+	display: table;
+	text-align: left;
+	margin: 1em;
+	border: 2px solid grey;
+}
+div.cell {
+	display: table-cell;
+	vertical-align: middle;
+}
+#controls {
+	background: lightgrey;
+	padding: 1em;
+}
