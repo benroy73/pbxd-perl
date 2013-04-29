@@ -118,6 +118,9 @@ sub processRequest {
         elsif ($result_xml =~ /Timeout waiting for client input/) {
             print $query->header(-status=>'408 Request Timeout', -type=>'application/xml');
         }
+        elsif ( defined($query->param('output_format')) && $query->param('output_format') eq 'text' ) {
+            print $query->header(-type=>'text/plain');
+        }
         else {
             print $query->header(-type=>'application/xml');
         }
@@ -164,6 +167,7 @@ Usage example:
             Paste the request XML data here.
             <div><textarea name="request" rows="10" cols="74"></textarea></div>
             <input name="submit_test" value="Submit" type="submit">
+            <input name="output_format" type="hidden" value="text">
         </form>
 
     </div>
